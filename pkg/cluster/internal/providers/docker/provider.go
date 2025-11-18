@@ -188,17 +188,36 @@ func (p *provider) GetAPIServerEndpoint(cluster string) (string, error) {
 	}
 
 	// else, retrieve the specific port mapping via NetworkSettings.Ports
+	// Use a template that handles nil Ports gracefully
 	cmd = exec.Command(
 		"docker", "inspect",
 		"--format", fmt.Sprintf(
-			"{{ with (index (index .NetworkSettings.Ports \"%d/tcp\") 0) }}{{ printf \"%%s\t%%s\" .HostIp .HostPort }}{{ end }}", common.APIServerInternalPort,
+			"{{ if .NetworkSettings.Ports }}{{ with (index (index .NetworkSettings.Ports \"%d/tcp\") 0) }}{{ printf \"%%s\t%%s\" .HostIp .HostPort }}{{ end }}{{ end }}", common.APIServerInternalPort,
 		),
 		n.String(),
 	)
 	lines, err = exec.OutputLines(cmd)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to get api server port")
+	// if the command failed or returned empty (nil Ports or no port mapping),
+	// fall back to using the container's IP address directly
+	// This handles macvlan/ipvlan networks where port mappings don't exist
+	if err != nil || len(lines) != 1 || lines[0] == "" {
+		// query the container's IP address from NetworkSettings
+		cmd = exec.Command(
+			"docker", "inspect",
+			"--format", "{{ range .NetworkSettings.Networks }}{{ .IPAddress }}{{ end }}",
+			n.String(),
+		)
+		lines, err = exec.OutputLines(cmd)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to get container IP address")
+		}
+		if len(lines) != 1 || lines[0] == "" {
+			return "", errors.Errorf("failed to get container IP address, got %d lines", len(lines))
+		}
+		// use the container's IP address with the internal API server port
+		return net.JoinHostPort(lines[0], fmt.Sprintf("%d", common.APIServerInternalPort)), nil
 	}
+
 	if len(lines) != 1 {
 		return "", errors.Errorf("network details should only be one line, got %d lines", len(lines))
 	}
